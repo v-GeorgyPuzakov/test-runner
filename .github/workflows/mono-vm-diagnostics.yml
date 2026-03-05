@@ -1,0 +1,88 @@
+name: Mono VM diagnostics
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  mono-diagnostics:
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-24.04
+          - ubuntu-22.04
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Print VM system info
+        shell: bash
+        run: |
+          set -euxo pipefail
+          echo "Runner OS: $RUNNER_OS"
+          echo "ImageOS: ${ImageOS:-unknown}"
+          echo "ImageVersion: ${ImageVersion:-unknown}"
+          uname -a
+          cat /etc/os-release
+          lsb_release -a || true
+          echo "Codename: $(lsb_release -cs)"
+
+      - name: Print APT and Mono repo diagnostics
+        shell: bash
+        run: |
+          set -euxo pipefail
+          CODENAME="$(lsb_release -cs)"
+          echo "=== Existing mono source files ==="
+          ls -la /etc/apt/sources.list.d | grep -i mono || true
+          echo "=== Mono index for stable ==="
+          curl -fsSL "https://download.mono-project.com/repo/ubuntu/dists/stable/index.html" | head -n 40 || true
+          echo "=== Mono index for stable-$CODENAME ==="
+          curl -fsSL "https://download.mono-project.com/repo/ubuntu/dists/stable-$CODENAME/index.html" | head -n 40 || true
+
+      - name: Prepare minimal helper scripts
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p ./helpers
+          cat > ./helpers/os.sh <<'EOF'
+          #!/bin/bash -e
+          is_ubuntu22() {
+              lsb_release -rs | grep -q '22.04'
+          }
+          is_ubuntu24() {
+              lsb_release -rs | grep -q '24.04'
+          }
+          EOF
+          chmod +x ./helpers/os.sh
+
+      - name: Run install-mono.sh with trace
+        shell: bash
+        continue-on-error: true
+        run: |
+          set -euxo pipefail
+          export HELPER_SCRIPTS="$GITHUB_WORKSPACE/helpers"
+          function invoke_tests() { :; }
+          export -f invoke_tests
+          sudo --preserve-env=HELPER_SCRIPTS bash -x ./install-mono.sh
+
+      - name: Print post-run package diagnostics
+        shell: bash
+        run: |
+          set -euxo pipefail
+          echo "=== mono source list ==="
+          sudo cat /etc/apt/sources.list.d/mono-official-stable.list || true
+          echo "=== apt-cache policy mono-complete ==="
+          apt-cache policy mono-complete || true
+          echo "=== apt-cache madison mono-complete ==="
+          apt-cache madison mono-complete || true
+          echo "=== helper apt-sources output ==="
+          cat "$GITHUB_WORKSPACE/helpers/apt-sources.txt" || true
