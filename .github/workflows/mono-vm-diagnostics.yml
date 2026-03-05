@@ -70,9 +70,10 @@ jobs:
         run: |
           set -euxo pipefail
           export HELPER_SCRIPTS="$GITHUB_WORKSPACE/helpers"
-          function invoke_tests() { :; }
-          export -f invoke_tests
-          sudo --preserve-env=HELPER_SCRIPTS bash -x ./install-mono.sh
+          sudo --preserve-env=HELPER_SCRIPTS bash -euxo pipefail -c '
+            invoke_tests() { :; }
+            source ./install-mono.sh
+          '
 
       - name: Print post-run package diagnostics
         shell: bash
