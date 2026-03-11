@@ -24,12 +24,4 @@ jobs:
       - name: Reproduce PSGallery issue
         shell: pwsh
         run: |
-          .\scripts\repro-psgallery-windows-2025.ps1 -Attempt '${{ matrix.attempt }}'
-
-      - name: Upload repro logs
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: psgallery-repro-attempt-${{ matrix.attempt }}
-          path: psgallery-repro-attempt-${{ matrix.attempt }}.log
-          if-no-files-found: warn
+          Install-Module -Name Microsoft.WinGet.Client -Repository PSGallery -Force
