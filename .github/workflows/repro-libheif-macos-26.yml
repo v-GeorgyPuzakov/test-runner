@@ -1,0 +1,188 @@
+name: "Repro #13902: libheif post-install fails on macos-26"
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  # ──────────────────────────────────────────────────────────
+  # 1. Reproduce the failure: bare `brew install imagemagick`
+  # ──────────────────────────────────────────────────────────
+  repro-imagemagick:
+    name: repro-imagemagick (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-26, macos-26-xlarge, macos-15, macos-15-xlarge]
+    steps:
+      - name: Environment info
+        run: |
+          echo "=== Runner image ==="
+          sw_vers
+          echo "=== Homebrew ==="
+          brew --version
+          echo "=== Architecture ==="
+          uname -m
+          echo "=== Brew prefix ==="
+          brew --prefix
+
+      - name: Install imagemagick (expect failure on macos-26)
+        run: brew install imagemagick
+
+      - name: Collect post-install logs on failure
+        if: failure()
+        run: |
+          echo "=== libheif post-install log ==="
+          cat ~/Library/Logs/Homebrew/libheif/post_install.01.update-mime-database.log 2>/dev/null || echo "Log not found"
+          echo ""
+          echo "=== shared-mime-info post-install log ==="
+          cat ~/Library/Logs/Homebrew/shared-mime-info/*.log 2>/dev/null || echo "Log not found"
+          echo ""
+          echo "=== All Homebrew logs ==="
+          find ~/Library/Logs/Homebrew -name "*.log" -exec echo "--- {} ---" \; -exec cat {} \; 2>/dev/null || echo "No logs"
+
+  # ──────────────────────────────────────────────────────────
+  # 2. Isolate: does update-mime-database crash on its own?
+  # ──────────────────────────────────────────────────────────
+  repro-mime-database:
+    name: repro-update-mime-db (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-26, macos-26-xlarge, macos-15, macos-15-xlarge]
+    steps:
+      - name: Install shared-mime-info
+        run: |
+          brew install shared-mime-info
+          echo "Exit code: $?"
+
+      - name: Run update-mime-database directly
+        run: |
+          which update-mime-database || echo "Not in PATH"
+          ls -la "$(brew --prefix)/opt/shared-mime-info/bin/update-mime-database" 2>/dev/null || true
+          echo "=== Running update-mime-database ==="
+          "$(brew --prefix)/opt/shared-mime-info/bin/update-mime-database" "$(brew --prefix)/share/mime" 2>&1 || true
+          echo "Exit code: $?"
+
+      - name: Check if MIME dir exists and has content
+        run: |
+          echo "=== MIME dir ==="
+          ls -la "$(brew --prefix)/share/mime/" 2>/dev/null || echo "Dir not found"
+          echo "=== MIME packages ==="
+          ls -la "$(brew --prefix)/share/mime/packages/" 2>/dev/null || echo "No packages dir"
+
+      - name: Collect logs on failure
+        if: failure()
+        run: |
+          find ~/Library/Logs/Homebrew -name "*.log" -exec echo "--- {} ---" \; -exec cat {} \; 2>/dev/null || echo "No logs"
+
+  # ──────────────────────────────────────────────────────────
+  # 3. Isolate: does libheif post-install specifically fail?
+  # ──────────────────────────────────────────────────────────
+  repro-libheif-postinstall:
+    name: repro-libheif-postinstall (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-26, macos-26-xlarge, macos-15, macos-15-xlarge]
+    steps:
+      - name: Install libheif with --skip-post-install
+        run: |
+          echo "=== Installing libheif without post-install ==="
+          brew install --skip-post-install libheif
+          echo "Exit code: $?"
+
+      - name: Run brew postinstall libheif
+        run: |
+          echo "=== Running postinstall for libheif ==="
+          brew postinstall libheif 2>&1 || true
+          echo "Exit code: $?"
+
+      - name: Collect logs
+        if: always()
+        run: |
+          find ~/Library/Logs/Homebrew -name "*.log" -exec echo "--- {} ---" \; -exec cat {} \; 2>/dev/null || echo "No logs"
+
+  # ──────────────────────────────────────────────────────────
+  # 4. Workaround A: pre-install shared-mime-info
+  # ──────────────────────────────────────────────────────────
+  workaround-pre-install-mime:
+    name: workaround-pre-install-mime (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-26, macos-26-xlarge]
+    steps:
+      - name: Pre-install shared-mime-info then imagemagick
+        run: |
+          echo "=== Step 1: Install shared-mime-info ==="
+          brew install shared-mime-info
+          echo "shared-mime-info exit code: $?"
+          echo ""
+          echo "=== Step 2: Initialize MIME database ==="
+          "$(brew --prefix)/opt/shared-mime-info/bin/update-mime-database" "$(brew --prefix)/share/mime" 2>&1 || true
+          echo ""
+          echo "=== Step 3: Install imagemagick ==="
+          brew install imagemagick
+          echo "imagemagick exit code: $?"
+
+      - name: Verify imagemagick works
+        run: |
+          magick --version
+          echo "magick exit: $?"
+
+  # ──────────────────────────────────────────────────────────
+  # 5. Workaround B: skip-post-install libheif
+  # ──────────────────────────────────────────────────────────
+  workaround-skip-postinstall:
+    name: workaround-skip-postinstall (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-26, macos-26-xlarge]
+    steps:
+      - name: Install libheif with --skip-post-install then imagemagick
+        run: |
+          echo "=== Step 1: Install libheif without post-install ==="
+          brew install --skip-post-install libheif
+          echo "libheif exit code: $?"
+          echo ""
+          echo "=== Step 2: Install imagemagick ==="
+          brew install imagemagick
+          echo "imagemagick exit code: $?"
+
+      - name: Verify imagemagick works
+        run: |
+          magick --version
+          echo "magick exit: $?"
+
+  # ──────────────────────────────────────────────────────────
+  # 6. Workaround C: graphicsmagick (also reported failing)
+  # ──────────────────────────────────────────────────────────
+  repro-graphicsmagick:
+    name: repro-graphicsmagick (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-26, macos-26-xlarge]
+    steps:
+      - name: Install graphicsmagick
+        run: brew install graphicsmagick
+
+      - name: Verify graphicsmagick works
+        run: |
+          gm version
+          echo "gm exit: $?"
+
+      - name: Collect logs on failure
+        if: failure()
+        run: |
+          find ~/Library/Logs/Homebrew -name "*.log" -exec echo "--- {} ---" \; -exec cat {} \; 2>/dev/null || echo "No logs"
