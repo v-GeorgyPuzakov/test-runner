@@ -1,0 +1,42 @@
+name: "Repro #13902: brew install imagemagick + ghostscript"
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  repro:
+    name: repro (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-26, macos-26-xlarge, macos-15, macos-15-xlarge]
+    steps:
+      - name: Environment info
+        run: |
+          sw_vers
+          brew --version
+          uname -m
+
+      - name: Install Imagemagick
+        run: |
+          brew install imagemagick
+          brew install ghostscript
+
+      - name: Verify tools
+        if: always()
+        run: |
+          which magick && magick --version || echo "magick not found"
+          which gs && gs --version || echo "gs not found"
+
+      - name: Collect logs on failure
+        if: failure()
+        run: |
+          echo "=== libheif post-install log ==="
+          cat ~/Library/Logs/Homebrew/libheif/post_install.01.update-mime-database.log 2>/dev/null || echo "Log not found"
+          echo ""
+          echo "=== All Homebrew logs ==="
+          find ~/Library/Logs/Homebrew -name "*.log" -exec echo "--- {} ---" \; -exec cat {} \; 2>/dev/null || echo "No logs"
