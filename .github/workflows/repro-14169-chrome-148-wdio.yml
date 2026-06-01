@@ -1,0 +1,285 @@
+name: "Repro #14169: Chrome 148 WebdriverIO hang + Option 1 workaround"
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  # ──────────────────────────────────────────────────────────
+  # 0. Baseline: WDIO against system Chrome shipped on the image
+  #    Expected on broken images (>= ubuntu24/20260525.161.1 with
+  #    Chrome 148.0.7778.178): hang / "element did not become
+  #    interactable", killed by timeout-minutes.
+  # ──────────────────────────────────────────────────────────
+  baseline-system-chrome:
+    name: baseline (system Chrome on image)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 8
+    steps:
+      - name: System Chrome / driver info
+        run: |
+          echo "=== Runner image ==="
+          cat /etc/os-release | grep PRETTY_NAME || true
+          if [[ -f /imagegeneration/imagedata.json ]]; then
+            jq -r '.[] | select(.group=="Tools" or .group=="Browsers and Drivers") | "\(.name): \(.version)"' \
+              /imagegeneration/imagedata.json || true
+          fi
+          echo "=== Chrome ==="
+          /usr/bin/google-chrome --version || true
+          /usr/bin/chromedriver --version || true
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Scaffold minimal WDIO project (system Chrome)
+        run: |
+          set -euxo pipefail
+          mkdir -p wdio && cd wdio
+          npm init -y >/dev/null
+          npm i --silent --no-audit --no-fund \
+            webdriverio@9 \
+            @wdio/cli@9 \
+            @wdio/local-runner@9 \
+            @wdio/mocha-framework@9 \
+            @wdio/spec-reporter@9 \
+            mocha@10 \
+            chromedriver@latest
+
+          cat > wdio.conf.cjs <<'EOF'
+          exports.config = {
+            runner: 'local',
+            specs: ['./test/specs/**/*.cjs'],
+            maxInstances: 1,
+            capabilities: [{
+              browserName: 'chrome',
+              'goog:chromeOptions': {
+                args: [
+                  '--headless=new',
+                  '--no-sandbox',
+                  '--disable-dev-shm-usage',
+                  '--disable-gpu',
+                ],
+              },
+            }],
+            logLevel: 'info',
+            framework: 'mocha',
+            reporters: ['spec'],
+            mochaOpts: { ui: 'bdd', timeout: 120000 },
+            waitforTimeout: 30000,
+            connectionRetryTimeout: 120000,
+            connectionRetryCount: 1,
+          };
+          EOF
+
+          mkdir -p test/specs
+          cat > test/specs/click.spec.cjs <<'EOF'
+          const { expect } = require('@wdio/globals');
+          describe('Chrome 148 interactability repro (#14169)', () => {
+            it('loads example.com and clicks the "More information..." link', async () => {
+              await browser.url('https://example.com/');
+              const link = await $('a');
+              await link.waitForClickable({ timeout: 20000 });
+              await link.click();
+              const title = await browser.getTitle();
+              console.log('Page title after click:', title);
+              expect(title.length).toBeGreaterThan(0);
+            });
+          });
+          EOF
+
+      - name: Run WDIO against system Chrome (expected to hang on broken image)
+        working-directory: wdio
+        run: npx wdio run wdio.conf.cjs
+
+  # ──────────────────────────────────────────────────────────
+  # 1. Negative control: pin to the BROKEN Chrome 148.0.7778.178
+  #    via the same Option 1 action. Confirms the bug surface
+  #    is reproducible deterministically via CfT.
+  # ──────────────────────────────────────────────────────────
+  pinned-broken-chrome:
+    name: pinned BROKEN Chrome 148.0.7778.178 (negative control)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 8
+    steps:
+      - name: Install pinned Chrome 148.0.7778.178 (broken build)
+        id: setup-chrome
+        uses: browser-actions/setup-chrome@v1
+        with:
+          chrome-version: '148.0.7778.178'
+          install-dependencies: true
+          install-chromedriver: true
+
+      - name: Verify pinned binaries
+        run: |
+          echo "chrome-path: ${{ steps.setup-chrome.outputs.chrome-path }}"
+          echo "chromedriver-path: ${{ steps.setup-chrome.outputs.chromedriver-path }}"
+          "${{ steps.setup-chrome.outputs.chrome-path }}" --version
+          "${{ steps.setup-chrome.outputs.chromedriver-path }}" --version
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Scaffold WDIO using CHROME_BIN from pinned install
+        env:
+          CHROME_BIN: ${{ steps.setup-chrome.outputs.chrome-path }}
+          CHROMEWEBDRIVER: ${{ steps.setup-chrome.outputs.chromedriver-path }}
+        run: |
+          set -euxo pipefail
+          mkdir -p wdio && cd wdio
+          npm init -y >/dev/null
+          npm i --silent --no-audit --no-fund \
+            webdriverio@9 \
+            @wdio/cli@9 \
+            @wdio/local-runner@9 \
+            @wdio/mocha-framework@9 \
+            @wdio/spec-reporter@9 \
+            mocha@10
+
+          cat > wdio.conf.cjs <<'EOF'
+          exports.config = {
+            runner: 'local',
+            specs: ['./test/specs/**/*.cjs'],
+            maxInstances: 1,
+            capabilities: [{
+              browserName: 'chrome',
+              'goog:chromeOptions': {
+                binary: process.env.CHROME_BIN,
+                args: [
+                  '--headless=new',
+                  '--no-sandbox',
+                  '--disable-dev-shm-usage',
+                  '--disable-gpu',
+                ],
+              },
+            }],
+            logLevel: 'info',
+            framework: 'mocha',
+            reporters: ['spec'],
+            mochaOpts: { ui: 'bdd', timeout: 120000 },
+            waitforTimeout: 30000,
+            connectionRetryTimeout: 120000,
+            connectionRetryCount: 1,
+          };
+          EOF
+
+          mkdir -p test/specs
+          cat > test/specs/click.spec.cjs <<'EOF'
+          const { expect } = require('@wdio/globals');
+          describe('Chrome 148.0.7778.178 interactability repro (#14169)', () => {
+            it('loads example.com and clicks the "More information..." link', async () => {
+              await browser.url('https://example.com/');
+              const link = await $('a');
+              await link.waitForClickable({ timeout: 20000 });
+              await link.click();
+              const title = await browser.getTitle();
+              console.log('Page title after click:', title);
+              expect(title.length).toBeGreaterThan(0);
+            });
+          });
+          EOF
+
+      - name: Run WDIO against pinned BROKEN Chrome (expected to hang)
+        working-directory: wdio
+        env:
+          CHROME_BIN: ${{ steps.setup-chrome.outputs.chrome-path }}
+          CHROMEWEBDRIVER: ${{ steps.setup-chrome.outputs.chromedriver-path }}
+        run: npx wdio run wdio.conf.cjs
+
+  # ──────────────────────────────────────────────────────────
+  # 2. Option 1 workaround: pin to last GOOD Chrome 148.0.7778.167
+  #    via browser-actions/setup-chrome@v1, point WDIO at it via
+  #    CHROME_BIN. Expected: passes.
+  # ──────────────────────────────────────────────────────────
+  workaround-pinned-good-chrome:
+    name: Option 1 workaround — pinned Chrome 148.0.7778.167
+    runs-on: ubuntu-24.04
+    timeout-minutes: 8
+    steps:
+      - name: Install pinned Chrome 148.0.7778.167 (last good build)
+        id: setup-chrome
+        uses: browser-actions/setup-chrome@v1
+        with:
+          chrome-version: '148.0.7778.167'
+          install-dependencies: true
+          install-chromedriver: true
+
+      - name: Verify pinned binaries
+        run: |
+          echo "chrome-path: ${{ steps.setup-chrome.outputs.chrome-path }}"
+          echo "chromedriver-path: ${{ steps.setup-chrome.outputs.chromedriver-path }}"
+          "${{ steps.setup-chrome.outputs.chrome-path }}" --version
+          "${{ steps.setup-chrome.outputs.chromedriver-path }}" --version
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Scaffold WDIO using CHROME_BIN from pinned install
+        env:
+          CHROME_BIN: ${{ steps.setup-chrome.outputs.chrome-path }}
+          CHROMEWEBDRIVER: ${{ steps.setup-chrome.outputs.chromedriver-path }}
+        run: |
+          set -euxo pipefail
+          mkdir -p wdio && cd wdio
+          npm init -y >/dev/null
+          npm i --silent --no-audit --no-fund \
+            webdriverio@9 \
+            @wdio/cli@9 \
+            @wdio/local-runner@9 \
+            @wdio/mocha-framework@9 \
+            @wdio/spec-reporter@9 \
+            mocha@10
+
+          cat > wdio.conf.cjs <<'EOF'
+          exports.config = {
+            runner: 'local',
+            specs: ['./test/specs/**/*.cjs'],
+            maxInstances: 1,
+            capabilities: [{
+              browserName: 'chrome',
+              'goog:chromeOptions': {
+                binary: process.env.CHROME_BIN,
+                args: [
+                  '--headless=new',
+                  '--no-sandbox',
+                  '--disable-dev-shm-usage',
+                  '--disable-gpu',
+                ],
+              },
+            }],
+            logLevel: 'info',
+            framework: 'mocha',
+            reporters: ['spec'],
+            mochaOpts: { ui: 'bdd', timeout: 120000 },
+            waitforTimeout: 30000,
+            connectionRetryTimeout: 120000,
+            connectionRetryCount: 1,
+          };
+          EOF
+
+          mkdir -p test/specs
+          cat > test/specs/click.spec.cjs <<'EOF'
+          const { expect } = require('@wdio/globals');
+          describe('Chrome 148.0.7778.167 workaround validation (#14169)', () => {
+            it('loads example.com and clicks the "More information..." link', async () => {
+              await browser.url('https://example.com/');
+              const link = await $('a');
+              await link.waitForClickable({ timeout: 20000 });
+              await link.click();
+              const title = await browser.getTitle();
+              console.log('Page title after click:', title);
+              expect(title.length).toBeGreaterThan(0);
+            });
+          });
+          EOF
+
+      - name: Run WDIO against pinned GOOD Chrome (workaround — expected to pass)
+        working-directory: wdio
+        env:
+          CHROME_BIN: ${{ steps.setup-chrome.outputs.chrome-path }}
+          CHROMEWEBDRIVER: ${{ steps.setup-chrome.outputs.chromedriver-path }}
+        run: npx wdio run wdio.conf.cjs
