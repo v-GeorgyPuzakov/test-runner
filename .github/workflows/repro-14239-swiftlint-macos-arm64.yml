@@ -1,0 +1,127 @@
+name: "Repro #14239: macOS README lists SwiftLint but it is missing on Apple Silicon"
+
+# Issue: https://github.com/actions/runner-images/issues/14239
+#
+# Summary
+# -------
+# The macOS-15 software README lists "SwiftLint 0.63.3", yet on the default
+# `macos-15` (Apple Silicon / arm64) runner `swiftlint` is not found:
+#
+#     swiftlint: command not found
+#     ls: /opt/homebrew/bin/swiftlint: No such file or directory
+#     ls: /usr/local/bin/swiftlint:    No such file or directory
+#
+# Root cause (from actions/runner-images source)
+# ----------------------------------------------
+#   * images/macos/scripts/build/install-swiftlint.sh runs
+#       brew_smart_install "swiftlint"
+#       invoke_tests "Linters" "SwiftLint"
+#     and is wired into the macOS-14 / 15 / 26 Packer templates for ALL archs.
+#   * images/macos/scripts/tests/Linters.Tests.ps1 SKIPS the validation on
+#     Apple Silicon:  Describe "SwiftLint" -Skip:($os.IsArm64) { ... }
+#   * The published README is generated from the Intel (x64) build, where
+#     SwiftLint is present — so arm64 ships a README that claims a tool the
+#     image does not actually provide, and no test catches it.
+#
+# What this workflow does
+# -----------------------
+# Runs the exact repro snippet from the issue across arm64 and Intel macOS
+# runners so the discrepancy is visible side by side, then proves the tool is
+# installable on arm64 as a candidate fix.
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  # ──────────────────────────────────────────────────────────
+  # 1. Reproduce: check whether `swiftlint` exists on each image.
+  #    Expected:
+  #      - arm64 legs (macos-15 / macos-14 / macos-26): FAIL — tool missing,
+  #        even though the README documents it.
+  #      - Intel legs (macos-15-intel / -large): PASS — matches the README.
+  # ──────────────────────────────────────────────────────────
+  repro-swiftlint-presence:
+    name: swiftlint? ${{ matrix.os }} (${{ matrix.arch }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: macos-15, arch: arm64 }          # default label → Apple Silicon (bug)
+          - { os: macos-15-intel, arch: x64 }       # Intel alias → matches README
+          - { os: macos-15-large, arch: x64 }       # Intel (legacy label) → matches README
+          - { os: macos-14, arch: arm64 }          # same skip-on-arm64 path
+          - { os: macos-26, arch: arm64 }          # same skip-on-arm64 path
+    steps:
+      - name: Environment info
+        run: |
+          echo "=== Runner image ==="
+          sw_vers
+          echo "Expected arch (matrix): ${{ matrix.arch }}"
+          echo "Actual arch (uname -m): $(uname -m)"
+          echo "Actual arch (arch):     $(arch)"
+          echo "=== Homebrew ==="
+          brew --version | head -1
+          echo "brew --prefix: $(brew --prefix)"
+          if [[ -f /imagegeneration/imagedata.json ]]; then
+            echo "=== imagedata.json ==="
+            cat /imagegeneration/imagedata.json || true
+          fi
+
+      - name: Diagnostics — exact repro snippet from issue #14239
+        run: |
+          echo "PATH=$PATH"
+          echo "--- which swiftlint ---";    which swiftlint    || true
+          echo "--- command -v swiftlint ---"; command -v swiftlint || true
+          echo "--- arm64 brew prefix ---";   ls -l /opt/homebrew/bin/swiftlint || true
+          echo "--- x64 brew prefix ---";     ls -l /usr/local/bin/swiftlint   || true
+          echo "--- brew list --versions ---"; brew list --versions swiftlint  || true
+          echo "--- brew --prefix swiftlint ---"; brew --prefix swiftlint      || true
+
+      - name: Assert swiftlint is present (as the README claims)
+        run: |
+          if command -v swiftlint >/dev/null 2>&1; then
+            echo "FOUND: $(command -v swiftlint)"
+            file "$(command -v swiftlint)"
+            swiftlint version
+            echo "::notice title=swiftlint present on ${{ matrix.os }}::matches README"
+          else
+            echo "::error title=swiftlint MISSING on ${{ matrix.os }} (${{ matrix.arch }})::README lists SwiftLint but the binary is not installed (issue #14239)"
+            exit 1
+          fi
+
+  # ──────────────────────────────────────────────────────────
+  # 2. Candidate fix: install swiftlint via Homebrew on Apple
+  #    Silicon and validate, proving the formula has an arm64
+  #    bottle and that build + validation should not be skipped
+  #    on arm64.
+  # ──────────────────────────────────────────────────────────
+  workaround-install-on-arm64:
+    name: install swiftlint on arm64 (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-15, macos-14, macos-26]
+    steps:
+      - name: Pre-check (expected missing on arm64)
+        run: |
+          uname -m
+          command -v swiftlint && echo "already present" || echo "not present (as reported)"
+
+      - name: brew install swiftlint
+        run: |
+          brew update --quiet || true
+          brew install swiftlint
+
+      - name: Verify swiftlint works after install
+        run: |
+          echo "Resolved: $(command -v swiftlint)"
+          file "$(command -v swiftlint)"
+          swiftlint version
+          echo "::notice title=swiftlint installable on ${{ matrix.os }}::arm64 bottle works — build/validation should not be skipped"
