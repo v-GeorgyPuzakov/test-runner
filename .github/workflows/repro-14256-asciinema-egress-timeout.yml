@@ -1,0 +1,194 @@
+name: "Repro #14256: asciinema.org (109.107.37.0:443) egress timeout from Ubuntu runners"
+
+# Issue: https://github.com/actions/runner-images/issues/14256
+#
+# Summary
+# -------
+# Outbound HTTPS to asciinema.org (109.107.37.0:443, hosted on Brightbox UK)
+# consistently TIMES OUT from ubuntu-latest GitHub Actions runners, starting
+# ~June 16, 2026. Reported behaviour:
+#
+#   $ curl -4 -sS --connect-timeout 5 https://asciinema.org
+#   curl: (28) Failed to connect to asciinema.org port 443 after 5002 ms: Timeout
+#   $ curl -6 -sS --connect-timeout 5 https://asciinema.org
+#   curl: (7) Couldn't connect to server            # runners lack IPv6 routing
+#
+#   * DNS resolves fine (asciinema.org -> 109.107.37.0 / IPv6 2a02:1348:...)
+#   * IPv4 :443 connect hangs until timeout
+#   * Reachable from non-Azure networks (verified by reporter locally)
+#   * Also fails on ubuntu-26.04 (different error)
+#
+# This looks like a network-path / egress problem on the runner (Azure) network
+# to the Brightbox-hosted IP, NOT a software package issue.
+#
+# What this workflow does
+# -----------------------
+#   1. Full network diagnostics to asciinema.org across Ubuntu images (+ a
+#      macOS leg for cross-network comparison), captured non-fatally.
+#   2. Control checks to known-good hosts to prove general egress works.
+#   3. A final assertion that FAILS when asciinema.org:443 is unreachable,
+#      so the bug shows up red.
+
+on:
+  workflow_dispatch:
+  # Daily so we can see when/if the path heals.
+  schedule:
+    - cron: "17 6 * * *"
+
+permissions:
+  contents: read
+
+env:
+  TARGET_HOST: asciinema.org
+  TARGET_IP: 109.107.37.0
+  TARGET_PORT: "443"
+
+jobs:
+  # ──────────────────────────────────────────────────────────
+  # 1. Diagnostics + repro assertion across runner images.
+  #    Expected (broken): the IPv4 connect to asciinema.org:443
+  #    times out → "Assert reachable" step fails on Ubuntu legs.
+  # ──────────────────────────────────────────────────────────
+  egress-asciinema:
+    name: egress → asciinema.org (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 8
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04, ubuntu-22.04, ubuntu-26.04, macos-15]
+    steps:
+      - name: Environment info
+        shell: bash
+        run: |
+          echo "=== OS ==="
+          (cat /etc/os-release 2>/dev/null | grep PRETTY_NAME) || sw_vers || true
+          uname -a
+          echo "=== Public egress IP ==="
+          curl -4 -sS --connect-timeout 10 https://api.ipify.org || echo "(ipify failed)"
+          echo
+          echo "=== Local interfaces ==="
+          (ip -brief addr 2>/dev/null) || (ifconfig 2>/dev/null | grep -E 'inet ') || true
+
+      - name: DNS resolution for ${{ env.TARGET_HOST }}
+        shell: bash
+        run: |
+          echo "=== getent / dscacheutil ==="
+          getent hosts "$TARGET_HOST" || dscacheutil -q host -a name "$TARGET_HOST" || true
+          echo "=== python getaddrinfo ==="
+          python3 - "$TARGET_HOST" <<'PY'
+          import socket, sys
+          host = sys.argv[1]
+          for fam, label in ((socket.AF_INET, "A/IPv4"), (socket.AF_INET6, "AAAA/IPv6")):
+              try:
+                  res = socket.getaddrinfo(host, 443, fam, socket.SOCK_STREAM)
+                  print(label, "->", sorted({r[4][0] for r in res}))
+              except Exception as e:
+                  print(label, "-> ERROR", e)
+          PY
+
+      - name: IPv4 HTTPS connect (exact repro snippet, non-fatal)
+        shell: bash
+        run: |
+          set +e
+          echo "=== curl -4 https://$TARGET_HOST ==="
+          curl -4 -sS --connect-timeout 10 -o /dev/null -w "HTTP %{http_code} | connect=%{time_connect}s total=%{time_total}s\n" "https://$TARGET_HOST"
+          echo "curl -4 exit: $?"
+
+      - name: IPv6 HTTPS connect (expected no route, non-fatal)
+        shell: bash
+        run: |
+          set +e
+          echo "=== curl -6 https://$TARGET_HOST ==="
+          curl -6 -sS --connect-timeout 10 -o /dev/null -w "HTTP %{http_code} | connect=%{time_connect}s\n" "https://$TARGET_HOST"
+          echo "curl -6 exit: $?"
+
+      - name: Raw TCP connect to IP and host (non-fatal)
+        shell: bash
+        run: |
+          set +e
+          python3 - "$TARGET_HOST" "$TARGET_IP" "$TARGET_PORT" <<'PY'
+          import socket, sys, time
+          host, ip, port = sys.argv[1], sys.argv[2], int(sys.argv[3])
+          def probe(label, addr):
+              t0 = time.time()
+              s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+              s.settimeout(10)
+              try:
+                  s.connect((addr, port))
+                  print(f"{label} {addr}:{port} -> CONNECTED in {time.time()-t0:.2f}s")
+              except Exception as e:
+                  print(f"{label} {addr}:{port} -> FAILED after {time.time()-t0:.2f}s: {e}")
+              finally:
+                  s.close()
+          probe("by-IP  ", ip)
+          probe("by-name", host)
+          PY
+
+      - name: Traceroute to ${{ env.TARGET_IP }} (best-effort, non-fatal)
+        shell: bash
+        run: |
+          set +e
+          if command -v traceroute >/dev/null 2>&1; then
+            traceroute -n -w 2 -q 1 -m 20 "$TARGET_IP"
+          elif command -v sudo >/dev/null 2>&1 && [[ "$RUNNER_OS" == "Linux" ]]; then
+            sudo apt-get update -qq && sudo apt-get install -y -qq traceroute && traceroute -n -w 2 -q 1 -m 20 "$TARGET_IP"
+          else
+            echo "traceroute not available"
+          fi
+
+      - name: Control — known-good hosts must be reachable (non-fatal log)
+        shell: bash
+        run: |
+          set +e
+          for url in https://github.com https://example.com https://api.ipify.org; do
+            curl -4 -sS --connect-timeout 10 -o /dev/null -w "%{http_code} (connect=%{time_connect}s) $url\n" "$url"
+          done
+
+      - name: Assert asciinema.org:443 is reachable over IPv4 (FAILS = bug reproduced)
+        shell: bash
+        run: |
+          python3 - "$TARGET_HOST" "$TARGET_IP" "$TARGET_PORT" <<'PY'
+          import socket, sys, time
+          host, ip, port = sys.argv[1], sys.argv[2], int(sys.argv[3])
+          ok = False
+          for label, addr in (("by-name", host), ("by-IP", ip)):
+              t0 = time.time()
+              s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+              s.settimeout(10)
+              try:
+                  s.connect((addr, port))
+                  print(f"REACHABLE {label} {addr}:{port} in {time.time()-t0:.2f}s")
+                  ok = True
+              except Exception as e:
+                  print(f"UNREACHABLE {label} {addr}:{port} after {time.time()-t0:.2f}s: {e}")
+              finally:
+                  s.close()
+          if not ok:
+              print(f"::error title=asciinema.org egress timeout::Cannot reach {host} ({ip}):{port} over IPv4 from this runner (issue #14256)")
+              sys.exit(1)
+          print("::notice title=asciinema.org reachable::egress path OK from this runner")
+          PY
+
+  # ──────────────────────────────────────────────────────────
+  # 2. Control job: prove generic egress works from the same
+  #    Ubuntu images, isolating the problem to the asciinema IP.
+  # ──────────────────────────────────────────────────────────
+  control-generic-egress:
+    name: control egress (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 5
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04, ubuntu-22.04, ubuntu-26.04]
+    steps:
+      - name: Reach a set of known-good HTTPS endpoints
+        shell: bash
+        run: |
+          set -e
+          for url in https://github.com https://example.com https://raw.githubusercontent.com https://pypi.org; do
+            code=$(curl -4 -sS --connect-timeout 10 -o /dev/null -w "%{http_code}" "$url")
+            echo "$code  $url"
+          done
+          echo "Generic egress OK — confirms the timeout is specific to the asciinema.org path."
