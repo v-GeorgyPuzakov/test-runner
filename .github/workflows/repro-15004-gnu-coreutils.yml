@@ -1,0 +1,52 @@
+name: "Repro #15004: GNU coreutils workaround"
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-26.04
+    steps:
+      - name: Inspect package switch
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "ImageVersion=${ImageVersion:-unknown}"
+          apt-cache policy coreutils coreutils-from-uutils coreutils-from-gnu gnu-coreutils
+          sudo apt-get update -qq
+          sudo apt-get install --simulate coreutils-from-gnu
+          sudo apt-get install -y coreutils-from-gnu
+          readlink -f /usr/bin/test
+          /usr/bin/test --version
+          dpkg-query -W coreutils coreutils-from-gnu gnu-coreutils
+
+      - name: Validate ACL-aware test
+        shell: bash
+        run: |
+          set -euo pipefail
+          file="/run/runner-images-acl-gnu-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          trap 'sudo rm -f "$file"' EXIT
+
+          sudo install -o root -g root -m 0666 /dev/null "$file"
+          sudo setfacl -n -m u:runner:--- "$file"
+          getfacl --absolute-names "$file"
+
+          if sudo -u runner /usr/bin/test -w "$file"; then
+            echo "::error::GNU test still reports the ACL-denied file as writable"
+            exit 1
+          fi
+
+          set +e
+          sudo -u runner sh -c 'printf x >> "$1"' sh "$file"
+          write_status=$?
+          set -e
+
+          if [[ $write_status -eq 0 ]]; then
+            echo "::error::ACL did not prevent the actual write"
+            exit 1
+          fi
+
+          echo "GNU test and the kernel both report write access denied."
