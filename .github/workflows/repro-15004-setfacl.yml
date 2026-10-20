@@ -29,6 +29,12 @@ jobs:
           cat /etc/os-release
           findmnt -T /run/dbus/system_bus_socket -o TARGET,FSTYPE,OPTIONS
           dpkg-query -W acl coreutils dbus libc6 2>/dev/null || true
+          ls -l /usr/bin/test
+          readlink -f /usr/bin/test
+          /usr/bin/test --version || true
+          dpkg-query -S /usr/bin/test || true
+          dpkg-query -W 'rust-coreutils*' 'uutils*' 2>/dev/null || true
+          dpkg -l | grep -E 'coreutils|uutils' || true
           sudo -u runner id
           if command -v capsh >/dev/null; then
             sudo -u runner capsh --print
@@ -96,7 +102,7 @@ jobs:
 
           trace_file=$(mktemp)
           if command -v strace >/dev/null; then
-            sudo -u "$test_user" strace -f -e trace=access,faccessat,faccessat2 -o "$trace_file" /usr/bin/test -w "$socket"
+            sudo -u "$test_user" strace -f -e trace=file -o "$trace_file" /usr/bin/test -w "$socket"
             echo "=== test -w syscalls ==="
             cat "$trace_file"
           fi
