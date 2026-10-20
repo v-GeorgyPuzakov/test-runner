@@ -1,0 +1,138 @@
+name: "Repro #15004: setfacl on D-Bus socket"
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  reproduce:
+    name: setfacl (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-22.04
+          - ubuntu-24.04
+          - ubuntu-26.04
+
+    steps:
+      - name: Print environment information
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "ImageOS=${ImageOS:-unknown}"
+          echo "ImageVersion=${ImageVersion:-unknown}"
+          uname -a
+          cat /etc/os-release
+          findmnt -T /run/dbus/system_bus_socket -o TARGET,FSTYPE,OPTIONS
+          dpkg-query -W acl coreutils dbus libc6 2>/dev/null || true
+          sudo -u runner id
+          if command -v capsh >/dev/null; then
+            sudo -u runner capsh --print
+          fi
+
+      - name: Reproduce ACL enforcement
+        shell: bash
+        run: |
+          set -uo pipefail
+
+          socket=/run/dbus/system_bus_socket
+          test_user=runner
+          acl_backup=$(mktemp)
+          regular_file="/run/runner-images-acl-repro-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+
+          cleanup() {
+            set +e
+            sudo setfacl --restore="$acl_backup"
+            sudo rm -f "$regular_file"
+            rm -f "$acl_backup"
+          }
+          trap cleanup EXIT
+
+          getfacl --absolute-names "$socket" > "$acl_backup"
+
+          echo "=== Original socket ACL ==="
+          getfacl --absolute-names "$socket"
+
+          if sudo -u "$test_user" test -w "$socket"; then
+            echo "Baseline: socket is writable by $test_user"
+          else
+            echo "::error::Baseline socket is unexpectedly not writable by $test_user"
+            exit 1
+          fi
+
+          echo "=== Apply deny ACL to socket ==="
+          sudo setfacl -n -m "u:${test_user}:---" "$socket"
+          getfacl --absolute-names "$socket"
+
+          set +e
+          sudo -u "$test_user" test -w "$socket"
+          socket_test_status=$?
+
+          sudo -u "$test_user" python3 - "$socket" <<'PY'
+          import socket
+          import sys
+
+          path = sys.argv[1]
+          client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+          try:
+              client.connect(path)
+          except PermissionError as error:
+              print(f"Socket connect denied as expected: {error}")
+              sys.exit(13)
+          except OSError as error:
+              print(f"Socket connect failed with a non-permission error: {error}")
+              sys.exit(2)
+          else:
+              print("Socket connect succeeded")
+              sys.exit(0)
+          finally:
+              client.close()
+          PY
+          socket_connect_status=$?
+
+          trace_file=$(mktemp)
+          if command -v strace >/dev/null; then
+            sudo -u "$test_user" strace -f -e trace=access,faccessat,faccessat2 -o "$trace_file" /usr/bin/test -w "$socket"
+            echo "=== test -w syscalls ==="
+            cat "$trace_file"
+          fi
+          rm -f "$trace_file"
+
+          echo "=== Compare with a regular file on /run ==="
+          sudo install -o root -g root -m 0666 /dev/null "$regular_file"
+          sudo setfacl -n -m "u:${test_user}:---" "$regular_file"
+          getfacl --absolute-names "$regular_file"
+
+          sudo -u "$test_user" test -w "$regular_file"
+          regular_test_status=$?
+          sudo -u "$test_user" sh -c 'printf x >> "$1"' sh "$regular_file"
+          regular_write_status=$?
+          set -e
+
+          printf 'socket_test_status=%s\n' "$socket_test_status"
+          printf 'socket_connect_status=%s\n' "$socket_connect_status"
+          printf 'regular_test_status=%s\n' "$regular_test_status"
+          printf 'regular_write_status=%s\n' "$regular_write_status"
+
+          failed=0
+          if [[ $socket_test_status -eq 0 ]]; then
+            echo "::error::test -w still reports the D-Bus socket as writable after the deny ACL"
+            failed=1
+          fi
+          if [[ $socket_connect_status -eq 0 ]]; then
+            echo "::error::runner can still connect to the D-Bus socket after the deny ACL"
+            failed=1
+          elif [[ $socket_connect_status -ne 13 ]]; then
+            echo "::error::D-Bus socket connect failed for an unexpected reason"
+            failed=1
+          fi
+          if [[ $regular_test_status -eq 0 || $regular_write_status -eq 0 ]]; then
+            echo "::error::deny ACL is not enforced for a regular file on /run"
+            failed=1
+          fi
+
+          exit "$failed"
