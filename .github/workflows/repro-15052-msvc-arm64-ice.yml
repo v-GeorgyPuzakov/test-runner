@@ -57,6 +57,8 @@ jobs:
               @{ Toolset = '14.29'; Flags = '/O2' }
           )
 
+          # vcvarsall silently falls back to the host-native compiler when a cross toolset is missing
+          $expectedTarget = ($env:VCVARS_ARCH -split '_')[-1]
           $results = foreach ($case in $cases) {
               $vcvarsVersion = if ($case.Toolset -eq 'default') { '' } else { "-vcvars_ver=$($case.Toolset)" }
               $probeScript = Join-Path $env:RUNNER_TEMP 'probe.cmd'
@@ -73,8 +75,9 @@ jobs:
               Write-Host "::endgroup::"
 
               $compiler = [regex]::Match($output, 'c2\.dll:\s+Version\s+(\S+)').Groups[1].Value
+              $target = [regex]::Match($output, '\\bin\\Host[^\\]+\\([^\\]+)\\cl\.exe:', 'IgnoreCase').Groups[1].Value.ToLowerInvariant()
               $outcome = switch ($exitCode) {
-                  0 { 'pass' }
+                  0 { if ($target -eq $expectedTarget) { 'pass' } else { "wrong target ($target)" } }
                   77 { 'toolset not installed' }
                   9009 { 'cl.exe not found' }
                   default { if ($output -match 'C1001') { 'C1001 ICE' } else { 'fail' } }
@@ -83,6 +86,7 @@ jobs:
                   Arch     = $env:VCVARS_ARCH
                   Toolset  = $case.Toolset
                   Compiler = $compiler
+                  Target   = $target
                   Flags    = $case.Flags
                   Exit     = '0x{0:X8}' -f $exitCode
                   Result   = $outcome
@@ -93,7 +97,15 @@ jobs:
           $summary = @(
               "### $env:ImageOS $env:ImageVersion ($env:VCVARS_ARCH)"
               ''
-              '| Toolset | Compiler | Flags | Exit | Result |'
-              '| --- | --- | --- | --- | --- |'
-          ) + ($results | ForEach-Object { "| $($_.Toolset) | $($_.Compiler) | ``$($_.Flags)`` | $($_.Exit) | $($_.Result) |" })
+              '| Toolset | Compiler | Target | Flags | Exit | Result |'
+              '| --- | --- | --- | --- | --- | --- |'
+          ) + ($results | ForEach-Object { "| $($_.Toolset) | $($_.Compiler) | $($_.Target) | ``$($_.Flags)`` | $($_.Exit) | $($_.Result) |" })
           $summary | Add-Content -Path $env:GITHUB_STEP_SUMMARY
+
+          # A red job means the default compiler still crashes at /O2 for this target
+          $defaultCase = $results | Where-Object { $_.Toolset -eq 'default' -and $_.Flags -eq '/O2' }
+          if ($defaultCase.Result -eq 'C1001 ICE') {
+              Write-Host "::error::Default MSVC $($defaultCase.Compiler) crashes with C1001 for $env:VCVARS_ARCH at /O2"
+              exit 1
+          }
+          exit 0
