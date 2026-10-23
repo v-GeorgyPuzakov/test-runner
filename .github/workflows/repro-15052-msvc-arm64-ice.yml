@@ -24,6 +24,8 @@ jobs:
             vcvars-arch: x64_arm64
           - runner: windows-latest
             vcvars-arch: x64
+          - runner: windows-2022
+            vcvars-arch: x64_arm64
     steps:
       - name: Download repro source
         shell: pwsh
@@ -80,7 +82,11 @@ jobs:
                   0 { if ($target -eq $expectedTarget) { 'pass' } else { "wrong target ($target)" } }
                   77 { 'toolset not installed' }
                   9009 { 'cl.exe not found' }
-                  default { if ($output -match 'C1001') { 'C1001 ICE' } else { 'fail' } }
+                  default {
+                      if ($output -match 'C1001') { 'C1001 ICE' }
+                      elseif ($output -match 'is not recognized') { 'cl.exe not found' }
+                      else { 'fail' }
+                  }
               }
               [pscustomobject]@{
                   Arch     = $env:VCVARS_ARCH
