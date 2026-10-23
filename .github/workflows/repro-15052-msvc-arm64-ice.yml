@@ -1,0 +1,99 @@
+name: "Repro #15052: MSVC 14.51 ARM64 ICE"
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  REPRO_URL: https://raw.githubusercontent.com/khmyznikov/h5py/ebcf20f9b68f9f7ba2fa0fa121c071b6bb7352b0/ci/msvc_arm64_repro.c
+  REPRO_SHA256: 3e63af12144e1d494672913c74637e99c501072aa0293671fd3faf2be4555aa9
+
+jobs:
+  probe:
+    name: ${{ matrix.runner }} (${{ matrix.vcvars-arch }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: windows-11-arm
+            vcvars-arch: arm64
+          - runner: windows-latest
+            vcvars-arch: x64_arm64
+          - runner: windows-latest
+            vcvars-arch: x64
+    steps:
+      - name: Download repro source
+        shell: pwsh
+        run: |
+          Write-Host "ImageOS=$env:ImageOS ImageVersion=$env:ImageVersion"
+          Invoke-WebRequest -Uri $env:REPRO_URL -OutFile repro.c
+          $hash = (Get-FileHash -Path repro.c -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($hash -ne $env:REPRO_SHA256) { throw "Unexpected repro.c hash: $hash" }
+
+      - name: Compile repro with available toolsets
+        shell: pwsh
+        env:
+          VCVARS_ARCH: ${{ matrix.vcvars-arch }}
+        run: |
+          $vsPath = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -property installationPath
+          $vcvars = Join-Path $vsPath 'VC\Auxiliary\Build\vcvarsall.bat'
+          Write-Host "Visual Studio: $vsPath"
+          Get-ChildItem -Path (Join-Path $vsPath 'VC\Tools\MSVC') -Directory | ForEach-Object {
+              $hostTargets = Get-ChildItem -Path (Join-Path $_.FullName 'bin') -Directory -ErrorAction SilentlyContinue | ForEach-Object {
+                  $hostName = $_.Name
+                  Get-ChildItem -Path $_.FullName -Directory | ForEach-Object { "$hostName\$($_.Name)" }
+              }
+              Write-Host "MSVC $($_.Name): $($hostTargets -join ', ')"
+          }
+
+          $cases = @(
+              @{ Toolset = 'default'; Flags = '/O2' }
+              @{ Toolset = 'default'; Flags = '/O2 /Oi-' }
+              @{ Toolset = 'default'; Flags = '/O1' }
+              @{ Toolset = '14.44'; Flags = '/O2' }
+              @{ Toolset = '14.29'; Flags = '/O2' }
+          )
+
+          $results = foreach ($case in $cases) {
+              $vcvarsVersion = if ($case.Toolset -eq 'default') { '' } else { "-vcvars_ver=$($case.Toolset)" }
+              $probeScript = Join-Path $env:RUNNER_TEMP 'probe.cmd'
+              @(
+                  '@echo off'
+                  "call `"$vcvars`" $env:VCVARS_ARCH $vcvarsVersion >nul || exit /b 77"
+                  "cl /Bv /nologo /c /std:c11 $($case.Flags) repro.c /Forepro.obj"
+              ) | Set-Content -Path $probeScript -Encoding ascii
+
+              Write-Host "::group::$env:VCVARS_ARCH toolset=$($case.Toolset) flags=$($case.Flags)"
+              $output = & cmd.exe /d /c $probeScript 2>&1 | Out-String
+              $exitCode = $LASTEXITCODE
+              Write-Host $output
+              Write-Host "::endgroup::"
+
+              $compiler = [regex]::Match($output, 'c2\.dll:\s+Version\s+(\S+)').Groups[1].Value
+              $outcome = switch ($exitCode) {
+                  0 { 'pass' }
+                  77 { 'toolset not installed' }
+                  9009 { 'cl.exe not found' }
+                  default { if ($output -match 'C1001') { 'C1001 ICE' } else { 'fail' } }
+              }
+              [pscustomobject]@{
+                  Arch     = $env:VCVARS_ARCH
+                  Toolset  = $case.Toolset
+                  Compiler = $compiler
+                  Flags    = $case.Flags
+                  Exit     = '0x{0:X8}' -f $exitCode
+                  Result   = $outcome
+              }
+          }
+
+          $results | Format-Table -AutoSize | Out-String -Width 200 | Write-Host
+          $summary = @(
+              "### $env:ImageOS $env:ImageVersion ($env:VCVARS_ARCH)"
+              ''
+              '| Toolset | Compiler | Flags | Exit | Result |'
+              '| --- | --- | --- | --- | --- |'
+          ) + ($results | ForEach-Object { "| $($_.Toolset) | $($_.Compiler) | ``$($_.Flags)`` | $($_.Exit) | $($_.Result) |" })
+          $summary | Add-Content -Path $env:GITHUB_STEP_SUMMARY
