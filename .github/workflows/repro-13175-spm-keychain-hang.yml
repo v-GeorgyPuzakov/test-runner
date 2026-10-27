@@ -1,0 +1,282 @@
+name: "Repro #13175: xcodebuild -resolvePackageDependencies hangs (Keychain consent dialog)"
+
+# Issue: https://github.com/actions/runner-images/issues/13175
+#
+# Hypothesis
+# ----------
+# The "hang" is not Xcode/VM slowness but a modal Keychain dialog nobody can answer:
+#   1. git on the image has credential.helper=osxkeychain in its *system* config
+#      (Homebrew git: $(brew --prefix)/etc/gitconfig,
+#       Xcode git:    Xcode.app/Contents/Developer/usr/share/git-core/gitconfig).
+#   2. The workflows in the issue embed a token in the URL:
+#        git config --global url."https://TOKEN@github.com/".insteadOf "https://github.com/"
+#      git "approves" URL-embedded credentials after a successful request
+#      (http.c -> credential_approve -> helper "store"), so git-credential-osxkeychain
+#      writes a github.com internet password into the login keychain. The item ACL
+#      trusts only git-credential-osxkeychain.
+#   3. xcodebuild resolves packages with `-packageAuthorizationProvider keychain`
+#      (default). SwiftPM's KeychainAuthorizationProvider calls SecItemCopyMatching for
+#      github.com before every binary-artifact download (Sparkle, Firebase, ...), and
+#      Xcode's built-in SCM consults the keychain as well. Reading the secret of another
+#      app's item needs user consent: SecurityAgent shows "xcodebuild wants to use your
+#      confidential information stored in "github.com" in your keychain" in the
+#      autologin GUI session and the call blocks forever. Other fetches/checkouts finish
+#      meanwhile, so the last log line names a "random" package.
+#
+# Scenarios (every scenario runs on a fresh VM)
+# ---------------------------------------------
+#   baseline               nothing configured, default flags                    -> expect OK
+#   insteadof              token in insteadOf URL (exact pattern from the issue),
+#                          default flags                                         -> ?
+#   primed                 insteadOf + one git CLI request (stores a github.com item
+#                          in the login keychain), default flags                -> expect HANG
+#   primed-scm-system      primed, -scmProvider system                          -> expect HANG
+#   primed-netrc           primed, -scmProvider system
+#                                  -packageAuthorizationProvider netrc          -> expect OK
+#   primed-xcode-defaults  primed, the same two settings as Xcode user defaults
+#                          (candidate image-level mitigation)                   -> expect OK
+#   no-osxkeychain         credential.helper reset in ~/.gitconfig before priming
+#                          (candidate image-level mitigation), default flags    -> expect OK
+#
+# A watchdog stops a command after HANG_LIMIT seconds and collects `ps`, a `sample` of
+# the process (keychain frames) and a screenshot of the GUI session (the dialog, if any).
+# Logs are scrubbed of URL-embedded credentials before they are uploaded.
+
+on:
+  workflow_dispatch:
+    inputs:
+      hang_limit:
+        description: Seconds after which a command is declared hung
+        default: "240"
+
+permissions:
+  contents: read
+
+jobs:
+  repro:
+    name: ${{ matrix.scenario }} / ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-15, macos-26]
+        scenario:
+          - baseline
+          - insteadof
+          - primed
+          - primed-scm-system
+          - primed-netrc
+          - primed-xcode-defaults
+          - no-osxkeychain
+    env:
+      SCENARIO: ${{ matrix.scenario }}
+      HANG_LIMIT: ${{ inputs.hang_limit || '240' }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Environment info
+        run: |
+          sw_vers
+          echo "arch=$(uname -m) ImageOS=${ImageOS:-?} ImageVersion=${ImageVersion:-?}"
+          xcode-select -p
+          xcodebuild -version
+          echo "PATH git: $(command -v git) ($(git --version))"
+          echo "/usr/bin/git: $(/usr/bin/git --version)"
+
+      - name: Prepare helpers and test package
+        run: |
+          DIAG="$RUNNER_TEMP/diag"; mkdir -p "$DIAG"
+
+          cat > "$RUNNER_TEMP/kcstatus.swift" <<'EOF'
+          import Security
+          var keychain: SecKeychain?
+          let copyStatus = SecKeychainCopyDefault(&keychain)
+          var status: SecKeychainStatus = 0
+          let getStatus = SecKeychainGetStatus(keychain, &status)
+          let unlocked = status & SecKeychainStatus(kSecUnlockStateStatus) != 0
+          print("default keychain: copy=\(copyStatus) get=\(getStatus) status=\(status) unlocked=\(unlocked)")
+          EOF
+          swiftc -suppress-warnings -o "$RUNNER_TEMP/kcstatus" "$RUNNER_TEMP/kcstatus.swift" || echo "::warning::kcstatus build failed"
+
+          cat > "$RUNNER_TEMP/kcdiag.sh" <<'EOF'
+          #!/bin/bash
+          # Keychain searches may block on a dialog if the keychain is locked -> run them with a limit
+          limited() {
+            local limit=$1 t=0 pid; shift
+            "$@" & pid=$!
+            while kill -0 "$pid" 2>/dev/null; do
+              if [ "$t" -ge "$limit" ]; then
+                echo "(timed out after ${limit}s: $1 $2)"; kill -KILL "$pid" 2>/dev/null; wait "$pid" 2>/dev/null; return 124
+              fi
+              sleep 1; t=$((t + 1))
+            done
+            wait "$pid"
+          }
+          echo "--- credential.helper (PATH git: $(command -v git)) ---"
+          git config --show-origin --get-all credential.helper || echo "(none)"
+          echo "--- credential.helper (/usr/bin/git, Xcode) ---"
+          /usr/bin/git config --show-origin --get-all credential.helper || echo "(none)"
+          echo "--- url.*.insteadOf (credentials masked) ---"
+          git config --global --get-regexp '^url\..*\.insteadof$' | sed -E 's#//[^@/]*@#//***@#' || echo "(none)"
+          echo "--- keychains ---"
+          security list-keychains -d user
+          security default-keychain -d user
+          security show-keychain-info "$HOME/Library/Keychains/login.keychain-db" 2>&1 || true
+          "$RUNNER_TEMP/kcstatus" || true
+          echo "--- github.com internet passwords (attributes only, account redacted) ---"
+          tmp=$(mktemp)
+          limited 15 security find-internet-password -s github.com > "$tmp" 2>/dev/null
+          if [ -s "$tmp" ]; then
+            grep -E '^keychain:|"srvr"|"ptcl"|"acct"|"crtr"|"labl"' "$tmp" | sed -E 's/("acct"<blob>=).*/\1<redacted>/'
+          else
+            echo "(none)"
+          fi
+          rm -f "$tmp"
+          echo "--- SecurityAgent ---"
+          pgrep -lf SecurityAgent || echo "(not running)"
+          EOF
+          chmod +x "$RUNNER_TEMP/kcdiag.sh"
+
+          PKG="$RUNNER_TEMP/pkg"; mkdir -p "$PKG/Sources/Repro13175"
+          cat > "$PKG/Package.swift" <<'EOF'
+          // swift-tools-version:5.9
+          import PackageDescription
+
+          let package = Package(
+              name: "Repro13175",
+              platforms: [.macOS(.v13)],
+              dependencies: [
+                  // binaryTarget downloaded from github.com/releases -> goes through the authorization provider
+                  .package(url: "https://github.com/sparkle-project/Sparkle", exact: "2.7.1"),
+                  // plain source dependencies, to get several "Fetching / Checking out" lines
+                  .package(url: "https://github.com/apple/swift-argument-parser", exact: "1.5.0"),
+                  .package(url: "https://github.com/apple/swift-log", exact: "1.6.1"),
+              ],
+              targets: [
+                  .executableTarget(
+                      name: "Repro13175",
+                      dependencies: [
+                          .product(name: "Sparkle", package: "Sparkle"),
+                          .product(name: "ArgumentParser", package: "swift-argument-parser"),
+                          .product(name: "Logging", package: "swift-log"),
+                      ]
+                  ),
+              ]
+          )
+          EOF
+          echo 'print("hello")' > "$PKG/Sources/Repro13175/main.swift"
+
+          cat > "$RUNNER_TEMP/watch.sh" <<'EOF'
+          # usage: watch_run <name> <limit-seconds> <command...>
+          collect() {
+            local name=$1 pid=$2 p
+            echo "--- processes ---"
+            ps -axo pid,ppid,etime,stat,command | grep -E 'xcodebuild|SecurityAgent|git-credential|git-remote|[ /]git ' | grep -v grep || true
+            if screencapture -x "$DIAG/$name-screen.png"; then echo "screenshot: $name-screen.png"; else echo "screencapture failed"; fi
+            for p in $pid $(pgrep -P "$pid"); do
+              sudo sample "$p" 2 -file "$DIAG/$name-sample-$p.txt" >/dev/null 2>&1 || true
+              sudo chown "$(id -un)" "$DIAG/$name-sample-$p.txt" 2>/dev/null || true
+            done
+            echo "--- keychain-related frames in samples ---"
+            grep -h -o -i -E '[A-Za-z0-9_$]*(SecItemCopyMatching|SecKeychain|SecurityAgent|KeychainAuthorizationProvider|httpAuthorizationHeader|SecItem|osxkeychain)[A-Za-z0-9_$]*' \
+              "$DIAG/$name"-sample-*.txt 2>/dev/null | sort | uniq -c | sort -rn | head -25 || true
+            "$RUNNER_TEMP/kcdiag.sh" || true
+          }
+          watch_run() {
+            local name=$1 limit=$2 t=0 rc pid c; shift 2
+            "$@" > "$DIAG/$name.log" 2>&1 &
+            pid=$!
+            while kill -0 "$pid" 2>/dev/null; do
+              if [ "$t" -ge "$limit" ]; then
+                echo "::error title=$SCENARIO / $name hung::still running after ${limit}s"
+                collect "$name" "$pid"
+                for c in $(pgrep -P "$pid"); do kill -TERM "$c" 2>/dev/null; done
+                kill -TERM "$pid" 2>/dev/null; sleep 5; kill -KILL "$pid" 2>/dev/null
+                wait "$pid" 2>/dev/null
+                echo "----- tail $name.log -----"; tail -n 30 "$DIAG/$name.log"
+                return 124
+              fi
+              sleep 5; t=$((t + 5))
+            done
+            wait "$pid"; rc=$?
+            echo "----- tail $name.log (rc=$rc, ~${t}s) -----"; tail -n 30 "$DIAG/$name.log"
+            return $rc
+          }
+          EOF
+
+      - name: Keychain state before the scenario
+        run: |
+          "$RUNNER_TEMP/kcdiag.sh"
+
+      - name: Scenario setup (${{ matrix.scenario }})
+        run: |
+          DIAG="$RUNNER_TEMP/diag"; source "$RUNNER_TEMP/watch.sh"
+          if [ "$SCENARIO" = "no-osxkeychain" ]; then
+            # An empty value resets the helper list inherited from the system gitconfig files
+            git config --global credential.helper ""
+          fi
+          case "$SCENARIO" in
+            insteadof|primed*|no-osxkeychain)
+              # Same pattern as in the issue (token embedded in the rewritten URL)
+              git config --global url."https://x-access-token:${GH_TOKEN}@github.com/".insteadOf "https://github.com/"
+              ;;
+          esac
+          case "$SCENARIO" in
+            primed*|no-osxkeychain)
+              # Any git CLI request with URL-embedded credentials -> credential "approve" -> osxkeychain "store"
+              watch_run prime 120 git ls-remote https://github.com/apple/swift-log refs/tags/1.6.1 \
+                || echo "::warning title=$SCENARIO::priming git ls-remote failed or hung (rc=$?)"
+              ;;
+          esac
+          if [ "$SCENARIO" = "primed-xcode-defaults" ]; then
+            defaults write com.apple.dt.Xcode IDEPackageAuthorizationProviderOverride -string netrc
+            defaults write com.apple.dt.Xcode IDEPackageSupportUseBuiltinSCM -bool NO
+            defaults read com.apple.dt.Xcode | grep -E 'IDEPackage(AuthorizationProviderOverride|SupportUseBuiltinSCM)'
+          fi
+          "$RUNNER_TEMP/kcdiag.sh"
+
+      - name: xcodebuild -resolvePackageDependencies (${{ matrix.scenario }})
+        id: resolve
+        run: |
+          DIAG="$RUNNER_TEMP/diag"; source "$RUNNER_TEMP/watch.sh"
+          case "$SCENARIO" in
+            primed-scm-system) FLAGS=(-scmProvider system) ;;
+            primed-netrc)      FLAGS=(-scmProvider system -packageAuthorizationProvider netrc) ;;
+            *)                 FLAGS=() ;;
+          esac
+          echo "extra flags: ${FLAGS[*]:-(none)}"
+          cd "$RUNNER_TEMP/pkg"
+          set +e
+          start=$(date +%s)
+          watch_run resolve "$HANG_LIMIT" xcodebuild -resolvePackageDependencies \
+            -clonedSourcePackagesDirPath "$RUNNER_TEMP/spm" "${FLAGS[@]}"
+          rc=$?
+          took=$(( $(date +%s) - start ))
+          "$RUNNER_TEMP/kcdiag.sh"
+          if [ $rc -eq 0 ]; then
+            echo "::notice title=$SCENARIO on $ImageOS::resolved OK in ${took}s"
+          elif [ $rc -eq 124 ]; then
+            echo "::error title=$SCENARIO on $ImageOS::HUNG (killed after ${HANG_LIMIT}s)"
+          else
+            echo "::error title=$SCENARIO on $ImageOS::failed with rc=$rc after ${took}s"
+          fi
+          exit $rc
+
+      - name: Scrub credentials from diagnostics
+        if: always()
+        run: |
+          DIAG="$RUNNER_TEMP/diag"
+          find "$DIAG" -type f \( -name '*.log' -o -name '*.txt' \) -exec \
+            sed -i '' -E 's#//[^/@[:space:]]+@github\.com#//***@github.com#g' {} +
+          if [ -n "$GH_TOKEN" ] && grep -rlF "$GH_TOKEN" "$DIAG"; then
+            echo "token still present, dropping text logs"; find "$DIAG" -type f \( -name '*.log' -o -name '*.txt' \) -delete
+          fi
+          ls -la "$DIAG"
+
+      - name: Upload diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: diag-${{ matrix.scenario }}-${{ matrix.os }}
+          path: ${{ runner.temp }}/diag
+          if-no-files-found: ignore
